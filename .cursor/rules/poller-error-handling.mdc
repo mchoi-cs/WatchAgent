@@ -1,0 +1,52 @@
+---
+description: How the poller must handle Open-Meteo failures
+globs: ["src/watchagent/poller.py", "src/watchagent/openmeteo.py"]
+alwaysApply: false
+---
+
+# Poller error handling
+
+The poll loop runs forever. A single failed fetch must not break it.
+
+## Rules
+
+- A failed fetch (any `httpx.HTTPError` or `OpenMeteoError`) must be caught
+  inside `Poller._fetch_with_retries`. Never let it propagate out of the
+  per-city task or `asyncio.gather` will tear down the cycle.
+- Log every failure at `WARNING` with these fields, exactly: `city`,
+  `http_status` (int or `None`), `retry` (int, starting at 1), `error` (str).
+- Retry up to `settings.poll_max_retries` times with exponential backoff
+  `settings.poll_retry_backoff * 2 ** (attempt - 1)`. After the last retry,
+  log a second `WARNING` with the suffix `(giving up)` and return `None`.
+- `_poll_city` returning `None` is a normal control-flow signal, not an
+  error. Do not log it again at the call site.
+- Never call `logger.exception` inside the poll loop — we are intentionally
+  swallowing per-city failures and `exception` implies an unhandled error.
+
+## What "good" looks like
+
+```python
+try:
+    return await self._client.fetch_current(city)
+except (httpx.HTTPError, OpenMeteoError) as exc:
+    logger.warning(
+        "open-meteo fetch failed (retrying)",
+        extra={
+            "city": city.name,
+            "http_status": _status_of(exc),
+            "retry": attempt,
+            "error": str(exc),
+        },
+    )
+```
+
+## What "bad" looks like
+
+```python
+# Bad: f-string log, no structured fields, raises out of the loop
+try:
+    return await self._client.fetch_current(city)
+except Exception as exc:
+    logger.error(f"failed to fetch {city.name}: {exc}")
+    raise
+```

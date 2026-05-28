@@ -1,0 +1,48 @@
+---
+description: Structured logging contract for the whole codebase
+globs: ["src/watchagent/**/*.py"]
+alwaysApply: false
+---
+
+# Logging contract
+
+We log to stdout in a single structured-ish format defined in
+`logging_setup.py`. The grader will read these logs; keep them parseable.
+
+## Rules
+
+- **No f-strings in log messages.** The message is a short noun phrase
+  describing the event (`"new reading stored"`, `"poll cycle complete"`).
+  All variable data goes in `extra={...}`.
+- **Logger names follow the module path.** Use `logger = logging.getLogger("watchagent.<module>")`
+  at the top of each module that logs.
+- **Level discipline:**
+  - `DEBUG` — duplicate reading skipped, individual retry math.
+  - `INFO` — state changes (poller started/stopped, reading stored, event fired, poll cycle complete).
+  - `WARNING` — recoverable failures (fetch retry, fetch giving up).
+  - `ERROR` — only for things a human should investigate. The poller itself
+    has none today.
+- **Stable field names across messages.** When you log a city, the key is
+  `city`. When you log an event type, the key is `event_type`. Do not
+  introduce synonyms like `city_name` or `kind`.
+- **Never log credentials or full response bodies.** We don't have
+  credentials, but the rule still applies.
+
+## Examples
+
+```python
+logger.info(
+    "event fired",
+    extra={
+        "city": ev.city,
+        "event_type": ev.event_type,
+        "severity": ev.severity,
+        "observed_at": ev.observed_at.isoformat(),
+    },
+)
+```
+
+```python
+# Bad
+logger.info(f"fired {ev.event_type} for {ev.city}")
+```

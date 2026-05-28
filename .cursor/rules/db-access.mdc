@@ -1,0 +1,47 @@
+---
+description: All database access must go through the Storage class
+globs: ["src/watchagent/**/*.py", "tests/**/*.py", ".cursor/skills/**/*.py"]
+alwaysApply: false
+---
+
+# Database access
+
+There is exactly one module that talks to `aiosqlite`: `storage.py`. Every
+other module — routes, the poller, tests, skills — goes through
+`Storage` (async) or `sqlite3` (sync, skills only).
+
+## Rules
+
+- **Routes never import `aiosqlite` or `sqlite3`.** They take `Storage`
+  off `request.app.state.storage` via the `_storage` helper.
+- **Tests never write raw SQL.** They use `Storage.store_reading`,
+  `Storage.store_events`, etc. Seeding helpers live in `tests/conftest.py`.
+- **New queries get a named method on `Storage` plus a unit test.** Inline
+  one-off SQL in a route or detector is a hard no.
+- **Schema lives in `SCHEMA` at the top of `storage.py`** and is applied
+  idempotently on connect. Migrations are not in scope for this challenge.
+- **Cursor skills are allowed to open their own read-only `sqlite3`
+  connection** — they're invoked outside the running API process and would
+  deadlock on the WAL otherwise. They still must not write.
+
+## Why
+
+Two reasons: (1) we can change storage engine (e.g. Postgres) without
+touching the API or poller, and (2) every query is testable in one place.
+
+## What "good" looks like
+
+```python
+# src/watchagent/api/routes.py
+storage = _storage(request)
+rows = await storage.recent_readings(city=city, limit=limit)
+```
+
+## What "bad" looks like
+
+```python
+# Bad — routes are now coupled to SQLite
+import aiosqlite
+async with aiosqlite.connect(DB_PATH) as conn:
+    rows = await conn.execute("SELECT * FROM readings WHERE city = ?", (city,))
+```

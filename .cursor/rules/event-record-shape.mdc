@@ -1,0 +1,44 @@
+---
+description: Required shape of every event written to the database
+globs: ["src/watchagent/events.py", "src/watchagent/storage.py", "tests/test_events.py"]
+alwaysApply: false
+---
+
+# Event record shape
+
+Every event the system writes must answer the question stated in the
+challenge spec: *what happened, in which city, when, and why we considered
+it notable.* That maps to four required fields.
+
+## Required fields on every `NewEvent`
+
+| Field         | Type              | Notes                                                                 |
+| ------------- | ----------------- | --------------------------------------------------------------------- |
+| `city`        | `str`             | One of the values in `config.CITY_NAMES`.                             |
+| `observed_at` | tz-aware `datetime` | Use the reading's `observed_at`, **not** `datetime.now()`.            |
+| `event_type`  | `str`             | Lowercase snake_case. Must be reused for the same logical detection.  |
+| `severity`    | `str`             | Exactly one of: `info`, `warning`, `critical`.                        |
+| `reason`      | `str`             | Human-readable, ≤200 chars, includes the value(s) that triggered it.  |
+| `reading_id`  | `int` (nullable)  | The id of the row that triggered the event, when applicable.          |
+
+`value` and `baseline` are optional numerics — populate them whenever the
+detector compares two scalars so the API client can show the delta without
+re-parsing `reason`.
+
+## Cooldown is mandatory
+
+Every new `event_type` you introduce must have an entry in `events.COOLDOWN`.
+Without it the type defaults to a zero cooldown and will fire on every poll
+of a sustained condition, which we explicitly do not want.
+
+## Testing contract
+
+Any new detector or `event_type` requires at least two tests in
+`tests/test_events.py`:
+
+1. A positive case: constructed sequence that should fire it.
+2. A negative case: nearby sequence that should *not* fire it.
+
+If the detector has a hysteresis or minimum-delta clause (like
+`MIN_ABS_DELTA_C` for temperature), add a third test that pushes right up to
+that threshold from the wrong side.
