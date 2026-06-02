@@ -363,6 +363,8 @@ code" rules.
 | `event-record-shape.mdc`            | Every `NewEvent` populates `city`, `observed_at`, `event_type`, `severity` ∈ `{info, warning, critical}`, `reason` (≤200 chars), and `reading_id` when applicable. New `event_type` values must have an entry in `events.COOLDOWN` and at least one positive and one negative test. |
 | `logging-contract.mdc`              | One logger name per module (`watchagent.<module>`), no f-strings in log messages, stable field names across calls (`city`, `event_type`, …), level discipline (`DEBUG`/`INFO`/`WARNING`/`ERROR`). Makes the logs grep-able.                                                       |
 | `db-access.mdc`                     | Routes, the poller, and tests never import `aiosqlite` or `sqlite3` directly — everything goes through `Storage`. The single exception is Cursor skills, which read with `sqlite3` because they run outside the API process. New queries get a named method and a test.            |
+| `architecture-patterns.mdc`         | The design patterns each module embodies and must preserve: Adapter (`openmeteo.py`), Facade/Repository (`storage.py`), a Strategy + pipeline of pure detectors (`events.py`), Dependency Injection at the composition root (`main.py`), and a fan-out/fan-in + guarded-suspension concurrency model (`poller.py`). |
+| `consistency-and-failure-model.mdc` | The CAP trade-off (AP toward Open-Meteo, CP on a single-node WAL store) and the invariants that dedup, backfill, and replay rely on: idempotent `INSERT OR IGNORE` writes keyed on `(city, observed_at)`, event-time (not wall-clock) ordering and cooldown, stale-tolerant reads, and a single-writer assumption. |
 
 ### Agent (`.cursor/agents/event-logic-reviewer.md`)
 

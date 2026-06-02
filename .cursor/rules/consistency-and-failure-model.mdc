@@ -1,0 +1,49 @@
+---
+description: Consistency, idempotency, and CAP trade-offs the system depends on
+globs: ["src/watchagent/**/*.py", "scripts/**/*.py", ".cursor/skills/**/*.py"]
+alwaysApply: false
+---
+
+# Consistency and failure model
+
+WatchAgent is a single process over a single SQLite file, but it has one real
+distributed boundary — **WatchAgent ↔ Open-Meteo** — and a set of consistency
+invariants that several features (dedup, backfill, replay) silently rely on.
+Changing any of these can break correctness without breaking a test you wrote,
+so treat them as contracts.
+
+## CAP trade-off (chosen deliberately)
+
+- **Toward Open-Meteo we choose Availability + Partition tolerance (AP).** When
+  the upstream is unreachable, the poller retries with backoff and ultimately
+  returns `None` — it never crashes and the API keeps serving stored data
+  (`poller-error-handling.mdc`). We accept staleness (sacrifice C); Open-Meteo
+  only refreshes hourly anyway.
+- **Our own store is effectively CP on one node.** SQLite WAL gives
+  single-writer / multi-reader linearizable access. The single file/process is
+  a deliberate single point of failure for this challenge; do not pretend it is
+  highly available.
+
+## Invariants (do not regress)
+
+- **Writes are idempotent.** `UNIQUE(city, observed_at)` + `INSERT OR IGNORE`
+  turns at-least-once polling into effectively-once storage. Do not replace this
+  with a plain `INSERT`, and keep `(city, observed_at)` as the dedup key.
+- **Event time, not wall-clock time.** Order, dedup, and cooldown all key off a
+  reading's `observed_at`, never `fetched_at` or `datetime.now()`. This is what
+  makes `scripts/backfill.py` and the replay skill produce the same events the
+  live poller would. New detectors and queries must preserve this.
+- **Reads tolerate staleness.** API routes serve whatever is in `Storage`; never
+  trigger a synchronous Open-Meteo fetch from a request handler. Freshness is the
+  poller's job.
+- **Single writer.** Only the poller writes. The WAL single-writer assumption and
+  the cooldown read-modify-write (read `last_event_at`, then `store_events`) are
+  not safe across multiple writer processes. If you ever scale out, this is the
+  assumption that breaks first — call it out rather than silently violating it.
+
+## Why this lives in a rule
+
+These guarantees are spread across `storage.py`, `events.py`, `poller.py`,
+`scripts/backfill.py`, and the skills. No single file makes the contract obvious,
+so it is easy to "optimise" one of them (e.g. dedup on `fetched_at`, or fetch on
+read) and quietly break replay determinism or duplicate suppression.

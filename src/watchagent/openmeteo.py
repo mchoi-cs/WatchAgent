@@ -1,9 +1,11 @@
 """Open-Meteo HTTP client.
 
-Owns the URL, the query-string shape, and the parsing of the JSON ``current``
-block into a normalised :class:`Reading`. Nothing else in the codebase knows
+Pattern: Adapter (see ``.cursor/rules/architecture-patterns.mdc``). This is the
+only module that knows the Open-Meteo URL and JSON wire shape; it translates the
+response into a normalised :class:`Reading`. Nothing else in the codebase knows
 about the Open-Meteo response shape, so if the upstream changes we only touch
-this file.
+this file. Owns the URL, the query-string shape, and the parsing of the JSON
+``current`` block.
 """
 
 from __future__ import annotations

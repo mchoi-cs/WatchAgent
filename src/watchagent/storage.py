@@ -1,5 +1,6 @@
 """SQLite storage layer.
 
+Pattern: Facade / Repository (see ``.cursor/rules/architecture-patterns.mdc``).
 Only this module talks to ``aiosqlite``. Routes, the poller, and tests all
 go through these functions — that constraint is what the ``db-access.mdc``
 rule enforces.

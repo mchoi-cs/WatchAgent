@@ -1,0 +1,57 @@
+---
+description: Design patterns the codebase relies on; preserve these boundaries
+globs: ["src/watchagent/**/*.py"]
+alwaysApply: false
+---
+
+# Architecture patterns
+
+WatchAgent is small but its structure is deliberate. Each module embodies a
+named pattern, and the other rules (`db-access.mdc`, `poller-error-handling.mdc`)
+are really just enforcement of these boundaries. Preserve the patterns; don't
+collapse the layers for convenience.
+
+## Structural boundaries (the load-bearing ones)
+
+- **Adapter — `openmeteo.py`.** `OpenMeteoClient` is the *only* module that
+  knows the Open-Meteo URL and JSON wire shape. It translates the response
+  into a normalised `Reading`. If upstream changes, only this file changes.
+  Do not parse Open-Meteo JSON anywhere else; do not leak the raw payload past
+  `_parse_current`.
+- **Facade / Repository — `storage.py`.** `Storage` is the single seam over
+  `aiosqlite`. Enforced in detail by `db-access.mdc`. Every query is a named
+  method; nothing else imports `aiosqlite`.
+
+These two patterns are what let us swap the weather source or the database
+engine without touching the poller, the detectors, or the API.
+
+## Behavioral — detector pipeline (`events.py`)
+
+- Each detector is a **pure function**: `(reading, history, ...) -> NewEvent | None`.
+  No I/O, no `Storage`, no `datetime.now()`. This is what makes them unit-testable
+  and replay-safe (see `consistency-and-failure-model.mdc`).
+- `candidate_events` runs the detectors (Strategy + pipeline); `apply_cooldown`
+  is a **separate filter stage**. Keep detection and cooldown separate so each
+  is testable in isolation.
+- Adding a detector = add one pure function and register it in `candidate_events`.
+  Do not inline detection logic into the poller.
+
+## Creational — composition root (`main.py`)
+
+- **Dependency Injection.** `lifespan` constructs `Storage`, `OpenMeteoClient`,
+  and `Poller`, then wires them. Each class takes its collaborators via its
+  constructor (`Poller(storage=..., client=..., settings=...)`). Inside these
+  classes, depend on the injected collaborators — do not reach for module-level
+  globals or construct your own `Storage`/client.
+- **Single config entry point.** Read configuration through `get_settings()`
+  only; never read `os.environ` directly elsewhere (see `config.py`).
+
+## Concurrency
+
+- **Fan-out / fan-in.** One poll cycle scatters per-city tasks with
+  `asyncio.gather` and joins the results (`poller.py`). A single city's failure
+  must stay isolated (see `poller-error-handling.mdc`).
+- **Guarded suspension for shutdown.** The loop waits on an `asyncio.Event`
+  with a timeout for the interval; that is the stop mechanism. Keep the poller
+  single-threaded async — do not introduce threads, `Lock`s, or blocking calls
+  into the loop.
