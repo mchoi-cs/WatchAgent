@@ -404,12 +404,30 @@ code" rules.
 | `architecture-patterns.mdc`         | The design patterns each module embodies and must preserve: Adapter (`openmeteo.py`), Facade/Repository (`storage.py`), a Strategy + pipeline of pure detectors (`events.py`), Dependency Injection at the composition root (`main.py`), and a fan-out/fan-in + guarded-suspension concurrency model (`poller.py`). |
 | `consistency-and-failure-model.mdc` | The CAP trade-off (AP toward Open-Meteo, CP on a single-node WAL store) and the invariants that dedup, backfill, and replay rely on: idempotent `INSERT OR IGNORE` writes keyed on `(city, observed_at)`, event-time (not wall-clock) ordering and cooldown, stale-tolerant reads, and a single-writer assumption. |
 
-### Agent (`.cursor/agents/event-logic-reviewer.md`)
+### Agents (`.cursor/agents/`)
+
+The agents are deliberately **atomic** — each owns exactly one concern, has a
+non-trivial system prompt (scope, what-it-knows, a concrete checklist, a
+boundary, and an output format), and hands off anything outside its lane to the
+agent that owns it. Four are **reviewers** (read + reason, advisory) and one is
+an **executor** (runs the verification suite). Each reviewer is the enforcement
+arm of a specific rule, so the rule states the contract and the agent applies
+it during review.
+
+| Agent | One job | Pairs with |
+| ----- | ------- | ---------- |
+| `event-logic-reviewer` | Detector signal-vs-noise economics (firing rate, cooldown, thresholds, cross-detector overlap). | `event-record-shape.mdc` |
+| `data-layer-reviewer` | Keep all DB access behind `Storage`; protect idempotency / event-time / single-writer invariants. | `db-access.mdc`, `consistency-and-failure-model.mdc` |
+| `poller-resilience-reviewer` | The poll loop never dies; bounded retry + backoff; structured WARNINGs. | `poller-error-handling.mdc` |
+| `ops-ci-agent` | The CLI/CI/container surface: two-job CI, Docker-without-keys, smoke, no committed secrets. | `ci.yml`, `Dockerfile`, `.gitignore` |
+| `qa-verifier` | **Executor:** runs `pytest` + the Docker smoke test + replay and reports GREEN/RED. | the test/CI contracts |
+
+#### `event-logic-reviewer`
 
 A scoped reviewer for changes to `src/watchagent/events.py` and
 `tests/test_events.py`. Its system prompt encodes:
 
-- the three detector families and why each exists,
+- the detector families and why each exists,
 - the firing-rate budget (≈72 readings/city/day, 3 cities),
 - the cooldown requirement,
 - the field-shape contract from `event-record-shape.mdc`,
@@ -420,6 +438,42 @@ Output is a numbered list of issues followed by `APPROVE` /
 `REQUEST_CHANGES`. It exists because the easiest way to silently degrade
 this system is by lowering a threshold without thinking about firing rate;
 the agent's job is to make that hard to do by accident.
+
+#### `data-layer-reviewer`
+
+Reviews anything that touches persistence (`storage.py`, plus DB access from
+routes, the poller, tests, or skills). It enforces that only `Storage` talks to
+`aiosqlite`, that every query is a named method with a test, and that the
+consistency invariants hold: idempotent `INSERT OR IGNORE` on
+`(city, observed_at)`, event-time ordering/cooldown, and the single-writer
+assumption. It exists because swapping a dedup key or a plain `INSERT` would
+duplicate rows and re-fire events without breaking an obvious test.
+
+#### `poller-resilience-reviewer`
+
+Reviews `poller.py` / `openmeteo.py` for one property: a single failed fetch
+must never tear down the poll cycle. It checks failure containment below
+`asyncio.gather`, bounded exponential-backoff retries, the giving-up path that
+returns `None`, the exact structured WARNING fields, and clean cooperative
+shutdown. It exists because the loop's survival under a flaky upstream is easy
+to regress with one stray `raise`.
+
+#### `ops-ci-agent`
+
+The "CLI" agent: it operates and guards the command-line surface — the
+two-job GitHub Actions pipeline, the keyless multi-stage Docker build (which
+must bundle `climate_normals.json`), the skill CLIs, and credential hygiene
+(`.gitignore` covers every `.env*` except the example; nothing secret is
+committed). It can run `docker build`, `scripts/smoke_test.sh`, the skills, and
+`gh run` to confirm CI status on a commit.
+
+#### `qa-verifier` (executor)
+
+Unlike the reviewers, this one **runs** things. It sets up the venv, runs
+`pytest -q`, runs `scripts/smoke_test.sh`, optionally replays readings through
+the detectors, scans the diff for missing positive/negative tests, and reports
+a `check | status | key output` table with a final `VERDICT: GREEN/RED`. It
+never edits code to make a check pass — failures are reported and handed back.
 
 ### Skills (`.cursor/skills/`)
 
