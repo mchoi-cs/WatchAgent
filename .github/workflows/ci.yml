@@ -45,3 +45,6 @@ jobs:
           push: false
           load: true
           tags: watchagent:ci
+
+      - name: Smoke test (start container, check /health)
+        run: ./scripts/smoke_test.sh watchagent:ci
