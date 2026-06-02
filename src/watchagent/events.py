@@ -39,6 +39,7 @@ from collections.abc import Iterable
 from datetime import datetime, timedelta
 from typing import Sequence
 
+from . import climate
 from .storage import NewEvent, StoredReading
 
 # ---- thresholds (single source of truth — README quotes these) -------------
@@ -53,6 +54,19 @@ WIND_SPIKE_MIN_KMH = 30.0          # ignore spikes from 0->5 etc.
 
 PRECIP_ONSET_BASELINE_MM = 0.2
 PRECIP_ONSET_TRIGGER_MM = 2.0
+
+# ---- compound / region-aware thresholds ----
+# These detectors look at *combinations* of attributes (and, for heat stress,
+# at the city's seasonal climate) rather than a single field.
+STORM_WIND_KMH = 35.0              # sustained wind that, with rain, reads as a storm
+STORM_PRECIP_MM = 2.0
+
+FREEZING_TEMP_C = 1.0              # at/below this *with* precip => freezing-rain risk
+FREEZING_PRECIP_MM = 0.2
+
+HEAT_ABS_MIN_C = 20.0             # floor so "heat stress" implies genuine warmth
+HEAT_APPARENT_GAP_C = 3.0        # apparent >> actual => humidity load
+HEAT_SEASONAL_Z = 1.0            # ...and hot for THIS city's season (region-aware)
 
 SEVERE_WEATHER_CODES: frozenset[int] = frozenset(
     {
@@ -75,6 +89,9 @@ COOLDOWN: dict[str, timedelta] = {
     "precip_onset": timedelta(hours=6),
     "severe_weather": timedelta(hours=6),
     "synchronized_weather": timedelta(hours=12),
+    "storm": timedelta(hours=6),
+    "freezing_rain": timedelta(hours=6),
+    "heat_stress": timedelta(hours=12),
 }
 
 
@@ -223,6 +240,89 @@ def detect_synchronized_weather(
     )
 
 
+def detect_storm(reading: StoredReading) -> NewEvent | None:
+    """Compound: strong wind *and* meaningful precipitation at once. Neither
+    alone is a storm — a dry gale or a calm downpour each have their own
+    detector — but together they are."""
+    if (
+        reading.wind_speed_kmh < STORM_WIND_KMH
+        or reading.precipitation_mm < STORM_PRECIP_MM
+    ):
+        return None
+    return NewEvent(
+        city=reading.city,
+        observed_at=reading.observed_at,
+        event_type="storm",
+        severity="warning",
+        value=reading.wind_speed_kmh,
+        baseline=None,
+        reading_id=reading.id,
+        reason=(
+            f"Storm conditions in {reading.city}: wind {reading.wind_speed_kmh:.0f} "
+            f"km/h with {reading.precipitation_mm:.1f} mm/h precipitation."
+        ),
+    )
+
+
+def detect_freezing_rain(reading: StoredReading) -> NewEvent | None:
+    """Compound: precipitation while at or below freezing. Catches freezing-rain
+    risk from the measurements even when the WMO code didn't flag it."""
+    if (
+        reading.temperature_c > FREEZING_TEMP_C
+        or reading.precipitation_mm < FREEZING_PRECIP_MM
+    ):
+        return None
+    return NewEvent(
+        city=reading.city,
+        observed_at=reading.observed_at,
+        event_type="freezing_rain",
+        severity="warning",
+        value=reading.temperature_c,
+        baseline=None,
+        reading_id=reading.id,
+        reason=(
+            f"Freezing-rain risk in {reading.city}: {reading.precipitation_mm:.1f} "
+            f"mm/h precipitation at {reading.temperature_c:.1f}C."
+        ),
+    )
+
+
+def detect_heat_stress(reading: StoredReading) -> NewEvent | None:
+    """Compound + region-aware: genuine warmth, a humidity load (apparent
+    temperature well above actual), *and* heat that is high for this city's
+    season. The seasonal check is what makes the same 28C mean different things
+    in maritime Vancouver vs continental Ottawa. Falls back to the warmth +
+    humidity test when we have no seasonal prior for the city."""
+    gap = reading.apparent_temperature_c - reading.temperature_c
+    if reading.temperature_c < HEAT_ABS_MIN_C or gap < HEAT_APPARENT_GAP_C:
+        return None
+
+    baseline_val: float | None = None
+    seasonal_note = ""
+    baseline = climate.seasonal_baseline(reading.city, reading.observed_at.month)
+    if baseline is not None:
+        mean, stddev = baseline
+        z = (reading.temperature_c - mean) / stddev
+        if z < HEAT_SEASONAL_Z:
+            return None
+        baseline_val = round(mean, 2)
+        seasonal_note = f", {z:+.1f}\u03c3 above the {reading.city} seasonal normal {mean:.1f}C"
+
+    return NewEvent(
+        city=reading.city,
+        observed_at=reading.observed_at,
+        event_type="heat_stress",
+        severity="warning",
+        value=reading.temperature_c,
+        baseline=baseline_val,
+        reading_id=reading.id,
+        reason=(
+            f"Heat stress in {reading.city}: {reading.temperature_c:.1f}C feels like "
+            f"{reading.apparent_temperature_c:.1f}C (+{gap:.1f}C humidity load){seasonal_note}."
+        ),
+    )
+
+
 # ---- orchestration ---------------------------------------------------------
 
 
@@ -240,6 +340,9 @@ def candidate_events(
         detect_precip_onset(reading, history),
         detect_severe_weather(reading),
         detect_synchronized_weather(reading, latest_per_city, all_city_names),
+        detect_storm(reading),
+        detect_freezing_rain(reading),
+        detect_heat_stress(reading),
     ]
     return [e for e in found if e is not None]
 

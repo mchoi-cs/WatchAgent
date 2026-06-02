@@ -1,0 +1,18 @@
+{
+  "_about": "Approximate per-city climate normals used as static priors for region-aware severity. monthly_mean_c is indexed 0=January..11=December (degrees C). daily_stddev_c is a coarse day-to-day spread around the monthly mean and encodes that continental Ottawa swings harder than maritime Vancouver. These are reference priors, not measurements; the hybrid baseline prefers stored history when enough exists (see analyze.py / events.py).",
+  "source": "Rounded long-term monthly mean temperatures (Environment Canada 1981-2010 normals, approximate).",
+  "cities": {
+    "Ottawa": {
+      "monthly_mean_c": [-10.3, -8.6, -2.5, 6.0, 13.3, 18.4, 21.0, 19.7, 14.9, 7.9, 1.5, -6.6],
+      "daily_stddev_c": 6.0
+    },
+    "Toronto": {
+      "monthly_mean_c": [-3.7, -2.6, 1.4, 7.9, 14.1, 19.4, 22.3, 21.5, 17.2, 10.7, 4.9, -0.5],
+      "daily_stddev_c": 5.0
+    },
+    "Vancouver": {
+      "monthly_mean_c": [4.1, 4.9, 6.9, 9.4, 12.8, 15.7, 18.0, 18.0, 14.9, 10.3, 6.3, 3.6],
+      "daily_stddev_c": 4.0
+    }
+  }
+}

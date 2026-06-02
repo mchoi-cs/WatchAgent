@@ -10,11 +10,16 @@ from datetime import datetime, timedelta, timezone
 
 from watchagent import events as event_logic
 from watchagent.events import (
+    HEAT_APPARENT_GAP_C,
     MIN_ABS_DELTA_C,
+    STORM_WIND_KMH,
     apply_cooldown,
     candidate_events,
+    detect_freezing_rain,
+    detect_heat_stress,
     detect_precip_onset,
     detect_severe_weather,
+    detect_storm,
     detect_synchronized_weather,
     detect_temperature_anomaly,
     detect_wind_spike,
@@ -177,6 +182,96 @@ def test_synchronized_weather_silent_when_one_city_differs() -> None:
         latest["Ottawa"], latest, ("Ottawa", "Toronto", "Vancouver")
     )
     assert event is None
+
+
+# ---- storm (compound: wind + precip) --------------------------------------
+
+
+def test_storm_fires_when_wind_and_precip_together() -> None:
+    event = detect_storm(_r(rid=1, wind=40.0, precip=3.0))
+    assert event is not None
+    assert event.event_type == "storm"
+    assert event.severity == "warning"
+    assert event.value == 40.0
+
+
+def test_storm_silent_on_dry_gale() -> None:
+    """Strong wind with no rain is a wind event, not a storm."""
+    assert detect_storm(_r(rid=1, wind=60.0, precip=0.0)) is None
+
+
+def test_storm_silent_on_calm_rain() -> None:
+    """Heavy rain with light wind is not a storm."""
+    assert detect_storm(_r(rid=1, wind=10.0, precip=8.0)) is None
+
+
+def test_storm_respects_wind_threshold_edge() -> None:
+    """Just under the wind threshold (with ample rain) must not fire."""
+    assert detect_storm(_r(rid=1, wind=STORM_WIND_KMH - 0.1, precip=8.0)) is None
+
+
+# ---- freezing rain (compound: cold + precip) ------------------------------
+
+
+def test_freezing_rain_fires_on_precip_at_subzero() -> None:
+    event = detect_freezing_rain(_r(rid=1, temperature=-2.0, precip=0.5))
+    assert event is not None
+    assert event.event_type == "freezing_rain"
+    assert event.severity == "warning"
+
+
+def test_freezing_rain_silent_on_warm_rain() -> None:
+    assert detect_freezing_rain(_r(rid=1, temperature=5.0, precip=2.0)) is None
+
+
+def test_freezing_rain_silent_on_cold_and_dry() -> None:
+    assert detect_freezing_rain(_r(rid=1, temperature=-8.0, precip=0.0)) is None
+
+
+def test_freezing_rain_respects_temp_threshold_edge() -> None:
+    """Just above the freezing threshold (with precip) must not fire."""
+    assert detect_freezing_rain(_r(rid=1, temperature=1.1, precip=0.5)) is None
+
+
+# ---- heat stress (compound + region-aware) --------------------------------
+
+
+def _r_july(city: str, *, temperature: float, apparent: float) -> StoredReading:
+    observed = datetime(2026, 7, 15, 12, tzinfo=timezone.utc)
+    return StoredReading(
+        id=1,
+        city=city,
+        observed_at=observed,
+        temperature_c=temperature,
+        apparent_temperature_c=apparent,
+        precipitation_mm=0.0,
+        wind_speed_kmh=5.0,
+        weather_code=1,
+        fetched_at=observed,
+    )
+
+
+def test_heat_stress_fires_when_humid_and_hot_for_season() -> None:
+    """30C with a big humidity load in Ottawa in May is hot for the season."""
+    event = detect_heat_stress(_r(rid=1, city="Ottawa", temperature=30.0, apparent=36.0))
+    assert event is not None
+    assert event.event_type == "heat_stress"
+    assert event.baseline is not None  # seasonal normal was applied
+    assert "seasonal normal" in event.reason
+
+
+def test_heat_stress_silent_without_humidity_load() -> None:
+    """Hot, but apparent temperature is not elevated => no humidity stress."""
+    new = _r(rid=1, city="Ottawa", temperature=30.0,
+             apparent=30.0 + HEAT_APPARENT_GAP_C - 0.5)
+    assert detect_heat_stress(new) is None
+
+
+def test_heat_stress_silent_when_normal_for_region_and_season() -> None:
+    """A humid 24C in Toronto in July is unremarkable for mid-summer, so the
+    region-aware seasonal gate suppresses it even though it's warm and humid."""
+    new = _r_july("Toronto", temperature=24.0, apparent=30.0)
+    assert detect_heat_stress(new) is None
 
 
 # ---- cooldown -------------------------------------------------------------

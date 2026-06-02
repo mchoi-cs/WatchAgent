@@ -245,10 +245,12 @@ CI runs the same command on every push to `main`.
 
 The brief explicitly warns against "fire when temperature > 30°C" — and also
 against "no events at all" or "events that never stop firing". The design
-below is structured around three different signal shapes, because using the
+below is structured around four different signal shapes, because using the
 same approach for all five fields would produce one of those failure modes.
+The first three look at a single field; the fourth looks at *combinations* of
+fields (and, for heat stress, at the city's seasonal climate).
 
-### Three detector families
+### Detector families
 
 #### 1. Per-city contextual anomaly (temperature)
 
@@ -314,6 +316,39 @@ Two detectors here, both keyed on WMO `weather_code`.
   cities all reporting "light rain" simultaneously, however, is a
   coordinated weather system worth surfacing.
 
+#### 4. Compound & region-aware (attribute combinations)
+
+The single-field detectors miss situations that only matter when two
+attributes coincide. These three read **multiple fields together**:
+
+- `storm` fires when `wind_speed_kmh ≥ STORM_WIND_KMH = 35` **and**
+  `precipitation_mm ≥ STORM_PRECIP_MM = 2`. A dry gale is just a `wind_spike`
+  and a calm downpour is just `precip_onset`; the *combination* is a storm.
+- `freezing_rain` fires when `temperature_c ≤ FREEZING_TEMP_C = 1` **and**
+  `precipitation_mm ≥ FREEZING_PRECIP_MM = 0.2`. This catches freezing-rain
+  risk from the measurements even when the upstream WMO code didn't label it
+  (it complements the code-based `severe_weather`).
+- `heat_stress` is the **region-aware** one. It fires only when all three of:
+  the reading is genuinely warm (`temperature_c ≥ HEAT_ABS_MIN_C = 20`),
+  there is a humidity load (`apparent − actual ≥ HEAT_APPARENT_GAP_C = 3`,
+  our proxy for humidity since we don't store it directly), **and** the
+  temperature is hot for *this city's season*
+  (`z ≥ HEAT_SEASONAL_Z = 1` against the per-city monthly normal in
+  `src/watchagent/climate_normals.json`). That seasonal term is what makes the
+  same humid 25°C a non-event in Toronto in July but notable in a city/season
+  where it's unusual. When no prior exists for a city it falls back to the
+  warmth + humidity test.
+
+| Constant               | Value | Field(s) it reads                          |
+| ---------------------- | ----- | ------------------------------------------ |
+| `STORM_WIND_KMH`       | `35`  | wind + precip                              |
+| `STORM_PRECIP_MM`      | `2.0` | wind + precip                              |
+| `FREEZING_TEMP_C`      | `1.0` | temp + precip                              |
+| `FREEZING_PRECIP_MM`   | `0.2` | temp + precip                              |
+| `HEAT_ABS_MIN_C`       | `20`  | temp + apparent + seasonal normal          |
+| `HEAT_APPARENT_GAP_C`  | `3.0` | temp + apparent (humidity proxy)           |
+| `HEAT_SEASONAL_Z`      | `1.0` | temp vs per-city monthly normal            |
+
 ### Cooldowns
 
 A heat wave that lasts 24 hours should produce **one** `temperature_anomaly`
@@ -327,6 +362,9 @@ in `events.COOLDOWN`:
 | `precip_onset`           | 6 h      |
 | `severe_weather`         | 6 h      |
 | `synchronized_weather`   | 12 h     |
+| `storm`                  | 6 h      |
+| `freezing_rain`          | 6 h      |
+| `heat_stress`            | 12 h     |
 
 Cooldowns are scoped to `(city, event_type)`, so a wind spike in Ottawa does
 not suppress a wind spike in Vancouver. The check is against the *observed*
@@ -392,14 +430,25 @@ the agent's job is to make that hard to do by accident.
 Opens the SQLite database **read-only** (`mode=ro` URI) and answers
 canonical questions:
 
-| `--question`        | Returns                                                                  |
-| ------------------- | ------------------------------------------------------------------------ |
-| `event-counts`      | Per-city event totals, broken out by `event_type`.                       |
-| `temperature-trend` | Per-city mean / min / max temperature over the window.                   |
-| `time-window`       | Readings + events in the window, grouped by city.                        |
-| `synchronized`      | List of `synchronized_weather` events with their WMO code.               |
-| `event-types`       | Total count per event type across all cities.                            |
-| `dedup-check`       | Verifies `(city, observed_at)` uniqueness; flags any anomalies.          |
+| `--question`          | Returns                                                                  |
+| --------------------- | ------------------------------------------------------------------------ |
+| `event-counts`        | Per-city event totals, broken out by `event_type`.                       |
+| `temperature-trend`   | Per-city mean / min / max temperature over the window.                   |
+| `time-window`         | Readings + events in the window, grouped by city.                        |
+| `synchronized`        | List of `synchronized_weather` events with their WMO code.               |
+| `event-types`         | Total count per event type across all cities.                            |
+| `dedup-check`         | Verifies `(city, observed_at)` uniqueness; flags any anomalies.          |
+| `attribute-summary`   | Per-city distribution (mean/min/max/p10/p50/p90) for **all** measured attributes + decoded weather-code mix. |
+| `compound-conditions` | Co-occurring severe attributes per city (storm = wind+rain, freezing-rain risk = cold+precip, heat stress = heat+humidity gap, wind chill). |
+| `regional-baseline`   | Region- and season-aware temperature baseline: data-driven from stored history, falling back to per-city climate priors, scoring the latest reading. |
+
+The last three answer the "do attribute *combinations* mean something, and is
+this reading extreme *for this region*?" questions that single-attribute
+aggregates miss. `compound-conditions` reads two-or-more attributes together
+(e.g. high wind **and** heavy precipitation); `regional-baseline` uses
+`src/watchagent/climate_normals.json` so `25 °C` is judged differently in
+maritime Vancouver than in continental Ottawa, and degrades gracefully when
+the DB has little history.
 
 Stdout is a JSON object with a stable envelope: `question`, `window_hours`,
 `city`, `generated_at`, `result`. Uses only the stdlib so it runs without
