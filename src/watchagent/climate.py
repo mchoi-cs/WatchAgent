@@ -2,9 +2,10 @@
 
 Loads the static normals in ``climate_normals.json`` (same package directory)
 once at import and exposes a seasonal baseline ``(mean, stddev)`` per
-city/month. Used by the region-aware ``heat_stress`` detector so that "hot" is
-judged relative to a city's season rather than a flat global threshold, and
-mirrored read-only by the ``analyze_data`` skill.
+city/month. Used by the region-aware ``heat_warning`` and ``cold_warning``
+detectors so that "hot" and "cold" are judged relative to a city's season
+rather than a flat global threshold, and mirrored read-only by the
+``analyze_data`` skill.
 
 Loading is tolerant: if the data file is missing or malformed the table is
 empty and :func:`seasonal_baseline` returns ``None``, so callers fall back to

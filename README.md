@@ -324,7 +324,7 @@ against "no events at all" or "events that never stop firing". The design
 below is structured around four different signal shapes, because using the
 same approach for all five fields would produce one of those failure modes.
 The first three look at a single field; the fourth looks at *combinations* of
-fields (and, for heat stress, at the city's seasonal climate).
+fields (and, for the heat/cold warnings, at the city's seasonal climate).
 
 ### Detector families
 
@@ -395,7 +395,12 @@ Two detectors here, both keyed on WMO `weather_code`.
 #### 4. Compound & region-aware (attribute combinations)
 
 The single-field detectors miss situations that only matter when two
-attributes coincide. These three read **multiple fields together**:
+attributes coincide, and they apply the same threshold everywhere. These four
+read **multiple fields together**, and the heat/cold warnings additionally
+judge "hot" and "cold" against *each city's* seasonal climate. A single
+reading can satisfy several at once — that co-occurrence is deliberate: a
+sub-freezing reading with rain fires both `freezing_rain` **and**
+`severe_weather`.
 
 - `storm` fires when `wind_speed_kmh ≥ STORM_WIND_KMH = 35` **and**
   `precipitation_mm ≥ STORM_PRECIP_MM = 2`. A dry gale is just a `wind_spike`
@@ -404,26 +409,36 @@ attributes coincide. These three read **multiple fields together**:
   `precipitation_mm ≥ FREEZING_PRECIP_MM = 0.2`. This catches freezing-rain
   risk from the measurements even when the upstream WMO code didn't label it
   (it complements the code-based `severe_weather`).
-- `heat_stress` is the **region-aware** one. It fires only when all three of:
-  the reading is genuinely warm (`temperature_c ≥ HEAT_ABS_MIN_C = 20`),
-  there is a humidity load (`apparent − actual ≥ HEAT_APPARENT_GAP_C = 3`,
-  our proxy for humidity since we don't store it directly), **and** the
-  temperature is hot for *this city's season*
-  (`z ≥ HEAT_SEASONAL_Z = 1` against the per-city monthly normal in
-  `src/watchagent/climate_normals.json`). That seasonal term is what makes the
-  same humid 25°C a non-event in Toronto in July but notable in a city/season
-  where it's unusual. When no prior exists for a city it falls back to the
-  warmth + humidity test.
+- `heat_warning` is **region-aware**. It fires when the reading is genuinely
+  warm (`temperature_c ≥ HEAT_ABS_MIN_C = 20`) **and** hot for *this city's
+  season* (`z ≥ HEAT_SEASONAL_Z = 1` against the per-city monthly normal in
+  `src/watchagent/climate_normals.json`). Humidity is a **severity modifier,
+  not a gate**: a humidity load (`apparent − actual ≥ HEAT_APPARENT_GAP_C = 3`,
+  our proxy for humidity) escalates it to `critical` (humidex), while a
+  hot-but-dry day is a `warning`. The seasonal term is what makes a humid 25°C
+  a non-event in Toronto in July but notable where it's unusual. With no prior
+  for a city it falls back to requiring the humidity load.
+- `cold_warning` is the winter **mirror of `heat_warning`**, and is what makes
+  "inclement winter" specific to each city. It fires when the reading is
+  genuinely cold (`temperature_c ≤ COLD_ABS_MAX_C = 5`) **and** cold for *this
+  city's season* (`z ≤ −COLD_SEASONAL_Z = −1`). Wind chill
+  (`actual − apparent ≥ COLD_WINDCHILL_GAP_C = 3`) or freezing precipitation
+  escalates it to `critical`; otherwise it's a `warning`. This is why a calm
+  −3°C is silent in Ottawa (routine for January) but fires in mild Vancouver
+  (≈1.8σ below its normal). With no prior it falls back to requiring wind chill.
 
-| Constant               | Value | Field(s) it reads                          |
-| ---------------------- | ----- | ------------------------------------------ |
-| `STORM_WIND_KMH`       | `35`  | wind + precip                              |
-| `STORM_PRECIP_MM`      | `2.0` | wind + precip                              |
-| `FREEZING_TEMP_C`      | `1.0` | temp + precip                              |
-| `FREEZING_PRECIP_MM`   | `0.2` | temp + precip                              |
-| `HEAT_ABS_MIN_C`       | `20`  | temp + apparent + seasonal normal          |
-| `HEAT_APPARENT_GAP_C`  | `3.0` | temp + apparent (humidity proxy)           |
-| `HEAT_SEASONAL_Z`      | `1.0` | temp vs per-city monthly normal            |
+| Constant                | Value | Field(s) it reads                          |
+| ----------------------- | ----- | ------------------------------------------ |
+| `STORM_WIND_KMH`        | `35`  | wind + precip                              |
+| `STORM_PRECIP_MM`       | `2.0` | wind + precip                              |
+| `FREEZING_TEMP_C`       | `1.0` | temp + precip                              |
+| `FREEZING_PRECIP_MM`    | `0.2` | temp + precip                              |
+| `HEAT_ABS_MIN_C`        | `20`  | temp + seasonal normal                     |
+| `HEAT_APPARENT_GAP_C`   | `3.0` | temp + apparent (humidity proxy → severity)|
+| `HEAT_SEASONAL_Z`       | `1.0` | temp vs per-city monthly normal            |
+| `COLD_ABS_MAX_C`        | `5.0` | temp + seasonal normal                     |
+| `COLD_WINDCHILL_GAP_C`  | `3.0` | temp + apparent (wind chill → severity)    |
+| `COLD_SEASONAL_Z`       | `1.0` | temp vs per-city monthly normal            |
 
 ### Cooldowns
 
@@ -440,7 +455,8 @@ in `events.COOLDOWN`:
 | `synchronized_weather`   | 12 h     |
 | `storm`                  | 6 h      |
 | `freezing_rain`          | 6 h      |
-| `heat_stress`            | 12 h     |
+| `heat_warning`           | 12 h     |
+| `cold_warning`           | 12 h     |
 
 Cooldowns are scoped to `(city, event_type)`, so a wind spike in Ottawa does
 not suppress a wind spike in Vancouver. The check is against the *observed*
@@ -495,9 +511,9 @@ to catch in review, so they get an agent each.
 project reuses a single source of truth rather than copying it. Detector
 thresholds live once in `events.py` and the README/agent *quote* them rather
 than restating them. The per-city climate normals live once in
-`climate_normals.json` and are read by both the region-aware `heat_stress`
-detector (via `climate.py`) and the `regional-baseline` skill question — the
-skill does not keep its own copy. Rules cross-reference each other
+`climate_normals.json` and are read by both the region-aware `heat_warning` /
+`cold_warning` detectors (via `climate.py`) and the `regional-baseline` skill
+question — the skill does not keep its own copy. Rules cross-reference each other
 (`architecture-patterns.mdc` points at `db-access.mdc` instead of re-explaining
 the storage boundary). This matters specifically *because* AI-assisted edits
 make duplication cheap to introduce and expensive to keep in sync; the

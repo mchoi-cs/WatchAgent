@@ -10,13 +10,14 @@ from datetime import datetime, timedelta, timezone
 
 from watchagent import events as event_logic
 from watchagent.events import (
-    HEAT_APPARENT_GAP_C,
+    COLD_ABS_MAX_C,
     MIN_ABS_DELTA_C,
     STORM_WIND_KMH,
     apply_cooldown,
     candidate_events,
+    detect_cold_warning,
     detect_freezing_rain,
-    detect_heat_stress,
+    detect_heat_warning,
     detect_precip_onset,
     detect_severe_weather,
     detect_storm,
@@ -233,45 +234,100 @@ def test_freezing_rain_respects_temp_threshold_edge() -> None:
     assert detect_freezing_rain(_r(rid=1, temperature=1.1, precip=0.5)) is None
 
 
-# ---- heat stress (compound + region-aware) --------------------------------
+# ---- heat warning (compound + region-aware) -------------------------------
 
 
-def _r_july(city: str, *, temperature: float, apparent: float) -> StoredReading:
-    observed = datetime(2026, 7, 15, 12, tzinfo=timezone.utc)
+def _r_on(
+    city: str,
+    *,
+    month: int,
+    temperature: float,
+    apparent: float,
+    precip: float = 0.0,
+) -> StoredReading:
+    observed = datetime(2026, month, 15, 12, tzinfo=timezone.utc)
     return StoredReading(
         id=1,
         city=city,
         observed_at=observed,
         temperature_c=temperature,
         apparent_temperature_c=apparent,
-        precipitation_mm=0.0,
+        precipitation_mm=precip,
         wind_speed_kmh=5.0,
         weather_code=1,
         fetched_at=observed,
     )
 
 
-def test_heat_stress_fires_when_humid_and_hot_for_season() -> None:
-    """30C with a big humidity load in Ottawa in May is hot for the season."""
-    event = detect_heat_stress(_r(rid=1, city="Ottawa", temperature=30.0, apparent=36.0))
+def test_heat_warning_is_critical_when_humid_and_hot_for_season() -> None:
+    """30C with a big humidity load in Ottawa in May is hot for the season; the
+    humidity load escalates it to critical."""
+    event = detect_heat_warning(_r(rid=1, city="Ottawa", temperature=30.0, apparent=36.0))
     assert event is not None
-    assert event.event_type == "heat_stress"
+    assert event.event_type == "heat_warning"
+    assert event.severity == "critical"
     assert event.baseline is not None  # seasonal normal was applied
     assert "seasonal normal" in event.reason
 
 
-def test_heat_stress_silent_without_humidity_load() -> None:
-    """Hot, but apparent temperature is not elevated => no humidity stress."""
-    new = _r(rid=1, city="Ottawa", temperature=30.0,
-             apparent=30.0 + HEAT_APPARENT_GAP_C - 0.5)
-    assert detect_heat_stress(new) is None
+def test_heat_warning_fires_warning_on_dry_hot_day() -> None:
+    """A hot-but-dry day that is still hot for the city's season fires a
+    warning (no humidity load to escalate it)."""
+    event = detect_heat_warning(_r(rid=1, city="Ottawa", temperature=33.0, apparent=33.0))
+    assert event is not None
+    assert event.event_type == "heat_warning"
+    assert event.severity == "warning"
+    assert "dry heat" in event.reason
 
 
-def test_heat_stress_silent_when_normal_for_region_and_season() -> None:
+def test_heat_warning_silent_when_normal_for_region_and_season() -> None:
     """A humid 24C in Toronto in July is unremarkable for mid-summer, so the
     region-aware seasonal gate suppresses it even though it's warm and humid."""
-    new = _r_july("Toronto", temperature=24.0, apparent=30.0)
-    assert detect_heat_stress(new) is None
+    new = _r_on("Toronto", month=7, temperature=24.0, apparent=30.0)
+    assert detect_heat_warning(new) is None
+
+
+def test_heat_warning_falls_back_to_humidity_without_prior() -> None:
+    """For a city we have no seasonal prior for, we cannot judge 'hot for
+    season', so a dry day is silent but a humid one still fires."""
+    dry = _r_on("Nowhere", month=7, temperature=30.0, apparent=30.0)
+    humid = _r_on("Nowhere", month=7, temperature=30.0, apparent=37.0)
+    assert detect_heat_warning(dry) is None
+    fired = detect_heat_warning(humid)
+    assert fired is not None and fired.severity == "critical"
+    assert fired.baseline is None  # no seasonal prior was available
+
+
+# ---- cold warning (compound + region-aware) -------------------------------
+
+
+def test_cold_warning_is_critical_with_wind_chill() -> None:
+    """-22C with an -30C wind chill in Ottawa in January is cold for the season
+    and the wind chill escalates it to critical."""
+    event = detect_cold_warning(_r_on("Ottawa", month=1, temperature=-22.0, apparent=-30.0))
+    assert event is not None
+    assert event.event_type == "cold_warning"
+    assert event.severity == "critical"
+    assert event.baseline is not None
+    assert "below the Ottawa seasonal normal" in event.reason
+
+
+def test_cold_warning_is_region_specific() -> None:
+    """-3C is routine for Ottawa in January (silent) but cold for the season in
+    mild Vancouver (fires) — the same temperature, judged per city."""
+    ottawa = _r_on("Ottawa", month=1, temperature=-3.0, apparent=-3.0)
+    vancouver = _r_on("Vancouver", month=1, temperature=-3.0, apparent=-3.0)
+    assert detect_cold_warning(ottawa) is None
+    fired = detect_cold_warning(vancouver)
+    assert fired is not None
+    assert fired.severity == "warning"  # cold for season, but no wind chill
+
+
+def test_cold_warning_silent_above_floor() -> None:
+    """A mild winter day above the absolute chill ceiling never fires, even if
+    a touch below the city's normal."""
+    new = _r_on("Vancouver", month=1, temperature=COLD_ABS_MAX_C + 0.1, apparent=-5.0)
+    assert detect_cold_warning(new) is None
 
 
 # ---- cooldown -------------------------------------------------------------

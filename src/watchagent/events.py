@@ -24,6 +24,16 @@ different kind of signal:
    share the same non-trivial weather code, that coordination itself is the
    story.
 
+4. **Compound / region-aware** (``storm``, ``freezing_rain``, ``heat_warning``,
+   ``cold_warning``). These read *combinations* of attributes — a single
+   reading can satisfy several at once, which is the point: cold + rain is
+   freezing rain, wind + rain is a storm. ``heat_warning`` and ``cold_warning``
+   are also region-aware: "hot" and "cold" are judged against each city's
+   seasonal climate normal (see :mod:`climate`), so the same temperature can be
+   newsworthy in maritime Vancouver yet unremarkable in continental Ottawa.
+   Humidity (heat) and wind chill / freezing precipitation (cold) act as
+   *severity* modifiers, escalating a ``warning`` to ``critical``.
+
 Cooldowns: each ``(city, event_type)`` pair has its own cooldown so a
 sustained heat wave fires one onset event rather than 24. The cooldown is
 checked against ``observed_at``, not wall-clock time.
@@ -56,17 +66,21 @@ PRECIP_ONSET_BASELINE_MM = 0.2
 PRECIP_ONSET_TRIGGER_MM = 2.0
 
 # ---- compound / region-aware thresholds ----
-# These detectors look at *combinations* of attributes (and, for heat stress,
-# at the city's seasonal climate) rather than a single field.
+# These detectors look at *combinations* of attributes (and, for the heat /
+# cold warnings, at the city's seasonal climate) rather than a single field.
 STORM_WIND_KMH = 35.0              # sustained wind that, with rain, reads as a storm
 STORM_PRECIP_MM = 2.0
 
 FREEZING_TEMP_C = 1.0              # at/below this *with* precip => freezing-rain risk
 FREEZING_PRECIP_MM = 0.2
 
-HEAT_ABS_MIN_C = 20.0             # floor so "heat stress" implies genuine warmth
-HEAT_APPARENT_GAP_C = 3.0        # apparent >> actual => humidity load
-HEAT_SEASONAL_Z = 1.0            # ...and hot for THIS city's season (region-aware)
+HEAT_ABS_MIN_C = 20.0            # floor so a heat warning implies genuine warmth
+HEAT_APPARENT_GAP_C = 3.0       # apparent >> actual => humidity load (escalates severity)
+HEAT_SEASONAL_Z = 1.0           # ...and hot for THIS city's season (region-aware)
+
+COLD_ABS_MAX_C = 5.0            # ceiling so a cold warning implies genuine chill
+COLD_WINDCHILL_GAP_C = 3.0      # actual >> apparent => wind chill (escalates severity)
+COLD_SEASONAL_Z = 1.0           # ...and cold for THIS city's season (region-aware)
 
 SEVERE_WEATHER_CODES: frozenset[int] = frozenset(
     {
@@ -91,7 +105,8 @@ COOLDOWN: dict[str, timedelta] = {
     "synchronized_weather": timedelta(hours=12),
     "storm": timedelta(hours=6),
     "freezing_rain": timedelta(hours=6),
-    "heat_stress": timedelta(hours=12),
+    "heat_warning": timedelta(hours=12),
+    "cold_warning": timedelta(hours=12),
 }
 
 
@@ -287,15 +302,21 @@ def detect_freezing_rain(reading: StoredReading) -> NewEvent | None:
     )
 
 
-def detect_heat_stress(reading: StoredReading) -> NewEvent | None:
-    """Compound + region-aware: genuine warmth, a humidity load (apparent
-    temperature well above actual), *and* heat that is high for this city's
-    season. The seasonal check is what makes the same 28C mean different things
-    in maritime Vancouver vs continental Ottawa. Falls back to the warmth +
-    humidity test when we have no seasonal prior for the city."""
-    gap = reading.apparent_temperature_c - reading.temperature_c
-    if reading.temperature_c < HEAT_ABS_MIN_C or gap < HEAT_APPARENT_GAP_C:
+def detect_heat_warning(reading: StoredReading) -> NewEvent | None:
+    """Compound + region-aware heat. Fires when it is genuinely warm *and* hot
+    for THIS city's season (seasonal z >= ``HEAT_SEASONAL_Z``), so the same 30C
+    means different things in maritime Vancouver vs continental Ottawa.
+
+    Humidity is a *severity* modifier, not a gate: a humid day (apparent
+    temperature well above actual) escalates to ``critical`` (humidex load),
+    while a hot-but-dry day is a ``warning``. When we have no seasonal prior for
+    the city we cannot judge "hot for season", so we fall back to requiring the
+    humidity load to avoid firing on every warm afternoon.
+    """
+    if reading.temperature_c < HEAT_ABS_MIN_C:
         return None
+    gap = reading.apparent_temperature_c - reading.temperature_c
+    humid = gap >= HEAT_APPARENT_GAP_C
 
     baseline_val: float | None = None
     seasonal_note = ""
@@ -307,18 +328,92 @@ def detect_heat_stress(reading: StoredReading) -> NewEvent | None:
             return None
         baseline_val = round(mean, 2)
         seasonal_note = f", {z:+.1f}\u03c3 above the {reading.city} seasonal normal {mean:.1f}C"
+    elif not humid:
+        # No regional prior and no humidity load => not enough signal to fire.
+        return None
+
+    if humid:
+        severity = "critical"
+        load_note = (
+            f" feels like {reading.apparent_temperature_c:.1f}C "
+            f"(+{gap:.1f}C humidity load)"
+        )
+    else:
+        severity = "warning"
+        load_note = " (dry heat)"
 
     return NewEvent(
         city=reading.city,
         observed_at=reading.observed_at,
-        event_type="heat_stress",
-        severity="warning",
+        event_type="heat_warning",
+        severity=severity,
         value=reading.temperature_c,
         baseline=baseline_val,
         reading_id=reading.id,
         reason=(
-            f"Heat stress in {reading.city}: {reading.temperature_c:.1f}C feels like "
-            f"{reading.apparent_temperature_c:.1f}C (+{gap:.1f}C humidity load){seasonal_note}."
+            f"Heat warning in {reading.city}: {reading.temperature_c:.1f}C"
+            f"{load_note}{seasonal_note}."
+        ),
+    )
+
+
+def detect_cold_warning(reading: StoredReading) -> NewEvent | None:
+    """Compound + region-aware cold — the winter mirror of ``heat_warning``.
+    Fires when it is genuinely cold *and* cold for THIS city's season
+    (seasonal z <= ``-COLD_SEASONAL_Z``), so a routine Ottawa winter day stays
+    quiet while the *same* temperature in mild Vancouver is news.
+
+    Wind chill (apparent temperature well below actual) or freezing
+    precipitation escalates to ``critical``; otherwise it is a ``warning``. With
+    no seasonal prior we fall back to requiring the wind-chill load.
+    """
+    if reading.temperature_c > COLD_ABS_MAX_C:
+        return None
+    chill_gap = reading.temperature_c - reading.apparent_temperature_c
+    windy_chill = chill_gap >= COLD_WINDCHILL_GAP_C
+    icy = (
+        reading.temperature_c <= FREEZING_TEMP_C
+        and reading.precipitation_mm >= FREEZING_PRECIP_MM
+    )
+
+    baseline_val: float | None = None
+    seasonal_note = ""
+    baseline = climate.seasonal_baseline(reading.city, reading.observed_at.month)
+    if baseline is not None:
+        mean, stddev = baseline
+        z = (reading.temperature_c - mean) / stddev
+        if z > -COLD_SEASONAL_Z:
+            return None
+        baseline_val = round(mean, 2)
+        seasonal_note = f", {abs(z):.1f}\u03c3 below the {reading.city} seasonal normal {mean:.1f}C"
+    elif not windy_chill:
+        # No regional prior and no wind-chill load => not enough signal to fire.
+        return None
+
+    if windy_chill:
+        severity = "critical"
+        load_note = (
+            f" feels like {reading.apparent_temperature_c:.1f}C "
+            f"(-{chill_gap:.1f}C wind chill)"
+        )
+    elif icy:
+        severity = "critical"
+        load_note = f" with {reading.precipitation_mm:.1f} mm/h freezing precipitation"
+    else:
+        severity = "warning"
+        load_note = ""
+
+    return NewEvent(
+        city=reading.city,
+        observed_at=reading.observed_at,
+        event_type="cold_warning",
+        severity=severity,
+        value=reading.temperature_c,
+        baseline=baseline_val,
+        reading_id=reading.id,
+        reason=(
+            f"Cold warning in {reading.city}: {reading.temperature_c:.1f}C"
+            f"{load_note}{seasonal_note}."
         ),
     )
 
@@ -342,7 +437,8 @@ def candidate_events(
         detect_synchronized_weather(reading, latest_per_city, all_city_names),
         detect_storm(reading),
         detect_freezing_rain(reading),
-        detect_heat_stress(reading),
+        detect_heat_warning(reading),
+        detect_cold_warning(reading),
     ]
     return [e for e in found if e is not None]
 

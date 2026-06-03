@@ -45,13 +45,19 @@ Three detector families exist (see `src/watchagent/events.py`):
    monitored city shares one non-trivial code.
 4. **Compound / region-aware** — detectors that read *combinations* of
    attributes: `detect_storm` (wind + precipitation), `detect_freezing_rain`
-   (sub-freezing temp + precipitation), and `detect_heat_stress` (warmth + a
-   humidity load via the apparent-vs-actual gap, gated by a per-city seasonal
-   z-score from `climate_normals.json`). Tunables: `STORM_WIND_KMH`,
-   `STORM_PRECIP_MM`, `FREEZING_TEMP_C`, `FREEZING_PRECIP_MM`,
-   `HEAT_ABS_MIN_C`, `HEAT_APPARENT_GAP_C`, `HEAT_SEASONAL_Z`. Watch for
-   overlap: `storm` vs `wind_spike`/`precip_onset`, and `freezing_rain` vs the
-   code-based `severe_weather`.
+   (sub-freezing temp + precipitation), and the region-aware pair
+   `detect_heat_warning` / `detect_cold_warning`. Both gate on a per-city
+   seasonal z-score from `climate_normals.json` (hot/cold *for this city's
+   season*) and use humidity (heat) or wind chill / freezing precip (cold) as a
+   **severity modifier** (`warning` → `critical`), not a firing gate; each falls
+   back to requiring that modifier when no seasonal prior exists. Tunables:
+   `STORM_WIND_KMH`, `STORM_PRECIP_MM`, `FREEZING_TEMP_C`, `FREEZING_PRECIP_MM`,
+   `HEAT_ABS_MIN_C`, `HEAT_APPARENT_GAP_C`, `HEAT_SEASONAL_Z`, `COLD_ABS_MAX_C`,
+   `COLD_WINDCHILL_GAP_C`, `COLD_SEASONAL_Z`. Watch for overlap: `storm` vs
+   `wind_spike`/`precip_onset`, `freezing_rain` vs the code-based
+   `severe_weather`, and `heat_warning`/`cold_warning` vs the rolling-window
+   `temperature_anomaly` (seasonal-normal vs recent-window are complementary by
+   design — flag only if one makes the other redundant).
 
 Every detector type has a cooldown entry in `events.COOLDOWN`. Without it,
 a sustained heat wave would produce 24 onset events in a day.
