@@ -35,16 +35,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
+      # Plain `docker build` uses the runner's built-in BuildKit (the default
+      # driver) rather than the docker-container driver from setup-buildx, which
+      # pulls moby/buildkit from Docker Hub and can time out on a flaky runner.
+      # No API keys are passed — the image must build without credentials.
       - name: Build image (no push, no credentials)
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          push: false
-          load: true
-          tags: watchagent:ci
+        run: docker build -t watchagent:ci .
 
       - name: Smoke test (start container, check /health)
         run: ./scripts/smoke_test.sh watchagent:ci
