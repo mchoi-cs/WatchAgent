@@ -14,6 +14,7 @@ keeps the design defensible as the code changes.
 
 ## Table of contents
 
+- [Cursor setup rationale](#cursor-setup-rationale)
 - [System overview](#system-overview)
 - [Architecture](#architecture)
 - [Running it](#running-it)
@@ -25,6 +26,58 @@ keeps the design defensible as the code changes.
 - [Project layout](#project-layout)
 
 ---
+
+## Cursor setup rationale
+
+### Rules
+
+Rules capture conventions that are specific to *this* codebase and that an edit
+could silently break — not generic "write clean code" advice. The emphasis is on
+**structural boundaries**, because the main failure mode of AI-assisted code
+generation is boundary erosion: parsing the upstream response in three places,
+or running raw SQL inside a route. There are six rules, each covering exactly
+one concern — poll-loop error handling, event-record shape, the logging
+contract, the single `Storage` data-access seam, the architectural patterns to
+preserve, and the consistency/CAP invariants. Where a convention is easy to
+break without failing an obvious test, it is also paired with an enforcing
+agent. (Full per-rule breakdown under [Cursor setup](#cursor-setup).)
+
+### Agents
+
+The agents are **atomic and specialized** — one job each, with real project
+context baked into the prompt (the firing-rate budget, the exact invariants),
+never a one-line "review this." Four are advisory **reviewers**, each the
+enforcement arm of a specific rule (event logic, data layer, poller resilience,
+and ops/CI), and one is an **executor**: `qa-verifier` actually runs `pytest`,
+the Docker smoke test, and replay, then reports GREEN/RED. Keeping each agent
+narrow is what lets its checklist be concrete enough to catch a real regression
+instead of hand-waving. (Full per-agent breakdown under [Cursor setup](#cursor-setup).)
+
+### Skills
+
+`analyze_data` (`analyze.py`) addresses the core problem of this challenge:
+balancing sensitivity against noise with logic that is **context-reliant,
+historical, regional, and selective**. Picking a single temperature threshold
+and applying the same judgement to every city is superficial — the cities sit
+in different geographies (continental Ottawa, the coldest, versus maritime
+Vancouver), so the same reading means different things. The skill therefore
+considers:
+
+1. **historical data** — distributions and baselines drawn from stored readings;
+2. **the unique geography of each region** — per-city seasonal climate normals,
+   so "extreme" is judged relative to that city and season;
+3. **combinations of weather attributes** — co-occurring signals (e.g. wind +
+   rain, or heat + humidity) rather than one field at a time.
+
+It runs read-only and emits structured JSON, and the same reasoning is mirrored
+in the region-aware detectors, with which it shares `climate_normals.json` as a
+single source of truth. A second skill, `replay_events`, re-runs stored readings
+through the *current* detectors so a threshold change can be checked before it
+ships. (Invocation and the full question catalogue are under
+[Cursor setup](#cursor-setup).)
+
+
+
 
 ## System overview
 
@@ -88,25 +141,48 @@ ASCII fallback:
 
 ## Running it
 
-Requires only Docker and Git.
+Requires only **Docker** and **Git** — no Python, no API keys.
 
 ```bash
-git clone <this-repo>
-cd watchagent
+git clone https://github.com/mchoi-cs/WatchAgent.git
+cd WatchAgent
 cp .env.example .env
 docker compose up --build
 ```
 
-After a few seconds the API is at `http://localhost:8000`:
+That builds the image and starts one container running the API and the
+background poller. Leave it running; it streams structured logs (you'll see
+`poller started` and, each cycle, `poll cycle complete`).
+
+### Verify it's working
+
+In a second terminal:
 
 ```bash
-curl http://localhost:8000/health
-# {"status":"ok","readings_stored":0,"events_stored":0}
+curl http://localhost:8000/health      # {"status":"ok","readings_stored":...}
+curl http://localhost:8000/readings    # live readings for the three cities
+curl http://localhost:8000/events      # detected notable events
+# or open http://localhost:8000/docs in a browser for the Swagger UI
+
+docker compose logs -f                  # follow the poller's logs
 ```
 
 The poller runs every `POLL_INTERVAL_SECONDS` (default 300 s). Because
 Open-Meteo only refreshes once per hour, the practical new-reading rate is
-about one row per city per hour ≈ 72 readings per day.
+about one row per city per hour ≈ 72 readings per day — so `/readings` fills in
+over time rather than all at once.
+
+### Stopping and managing
+
+```bash
+# Ctrl+C in the terminal running compose, then:
+docker compose down       # stop & remove the container (KEEPS collected data)
+docker compose down -v    # also delete the data volume (fresh start next time)
+docker compose up -d       # start again in the background (detached)
+```
+
+> Port 8000 must be free. If it's taken, change the host port in
+> `docker-compose.yml` (e.g. `"8001:8000"`) and use `http://localhost:8001`.
 
 ### Configuration
 
@@ -393,16 +469,106 @@ The `.cursor/` folder is part of the deliverable. Everything in it is tied
 to a concrete decision in this codebase — there are no generic "write clean
 code" rules.
 
+### Design rationale
+
+Three principles shaped every rule, agent, and skill here. They are the lens
+to read the rest of this section through.
+
+**1. Structural design patterns are the highest-leverage thing to encode for
+code generation.** When an AI assistant edits a codebase, the failure mode is
+rarely a bad expression on one line — it is *boundary erosion*: parsing the
+upstream JSON in three places, writing raw SQL inside a route, letting the
+detectors reach into the database. Of the pattern families (creational,
+structural, behavioral, concurrency), the **structural** ones are what define
+those boundaries, so they are what the Cursor setup spends most of its budget
+protecting. This codebase has two load-bearing structural patterns —
+**Adapter** (`openmeteo.py` is the only place that knows the Open-Meteo wire
+shape) and **Facade/Repository** (`storage.py` is the only place that touches
+`aiosqlite`) — and they are guarded three ways: documented in
+`architecture-patterns.mdc`, enforced by `db-access.mdc`, and reviewed by the
+`data-layer-reviewer` agent. Behavioral patterns (the Strategy pipeline of pure
+detectors) and the concurrency model (fan-out/fan-in + guarded suspension) are
+documented too, but the structural seams are the ones whose erosion is hardest
+to catch in review, so they get an agent each.
+
+**2. DRY when elaborating an existing implementation.** Every extension in this
+project reuses a single source of truth rather than copying it. Detector
+thresholds live once in `events.py` and the README/agent *quote* them rather
+than restating them. The per-city climate normals live once in
+`climate_normals.json` and are read by both the region-aware `heat_stress`
+detector (via `climate.py`) and the `regional-baseline` skill question — the
+skill does not keep its own copy. Rules cross-reference each other
+(`architecture-patterns.mdc` points at `db-access.mdc` instead of re-explaining
+the storage boundary). This matters specifically *because* AI-assisted edits
+make duplication cheap to introduce and expensive to keep in sync; the
+convention is "find the one place this fact already lives and extend that."
+
+**3. Testing at every step.** Verification is not a final gate, it is part of
+each change. The `event-record-shape.mdc` rule makes a positive **and** a
+negative test mandatory for every new `event_type` (plus a threshold-edge test
+when a `MIN_*`/`Z`-style guard is introduced), so the 38-test suite grew
+alongside the new compound detectors rather than after them. The `replay_events`
+skill lets a threshold change be checked against real captured data before it
+ships, and the `qa-verifier` agent exists precisely to *run* `pytest` + the
+Docker smoke test + replay and report GREEN/RED. CI re-runs the same `pytest`
+and `docker build` on every push to `main`, so "tested" means the same thing
+locally and on the server.
+
 ### Rules (`.cursor/rules/`)
 
-| File                                | What it enforces                                                                                                                                                                                                                       |
-| ----------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `poller-error-handling.mdc`         | A failed Open-Meteo fetch is logged at `WARNING` with `city`, `http_status`, `retry`, `error` and never raises out of the poll loop. Retries use exponential backoff with `POLL_RETRY_BACKOFF`. This is the concrete contract that makes the poll loop survive flaky upstreams. |
-| `event-record-shape.mdc`            | Every `NewEvent` populates `city`, `observed_at`, `event_type`, `severity` ∈ `{info, warning, critical}`, `reason` (≤200 chars), and `reading_id` when applicable. New `event_type` values must have an entry in `events.COOLDOWN` and at least one positive and one negative test. |
-| `logging-contract.mdc`              | One logger name per module (`watchagent.<module>`), no f-strings in log messages, stable field names across calls (`city`, `event_type`, …), level discipline (`DEBUG`/`INFO`/`WARNING`/`ERROR`). Makes the logs grep-able.                                                       |
-| `db-access.mdc`                     | Routes, the poller, and tests never import `aiosqlite` or `sqlite3` directly — everything goes through `Storage`. The single exception is Cursor skills, which read with `sqlite3` because they run outside the API process. New queries get a named method and a test.            |
-| `architecture-patterns.mdc`         | The design patterns each module embodies and must preserve: Adapter (`openmeteo.py`), Facade/Repository (`storage.py`), a Strategy + pipeline of pure detectors (`events.py`), Dependency Injection at the composition root (`main.py`), and a fan-out/fan-in + guarded-suspension concurrency model (`poller.py`). |
-| `consistency-and-failure-model.mdc` | The CAP trade-off (AP toward Open-Meteo, CP on a single-node WAL store) and the invariants that dedup, backfill, and replay rely on: idempotent `INSERT OR IGNORE` writes keyed on `(city, observed_at)`, event-time (not wall-clock) ordering and cooldown, stale-tolerant reads, and a single-writer assumption. |
+Each rule encodes a convention that is specific to *this* codebase and that an
+edit could plausibly break by accident. The table is a quick index; the
+rationale for each follows.
+
+| File                                | Enforces (one line)                                                          |
+| ----------------------------------- | ---------------------------------------------------------------------------- |
+| `poller-error-handling.mdc`         | A failed fetch never escapes the poll loop; structured `WARNING` + backoff.  |
+| `event-record-shape.mdc`            | Required `NewEvent` fields, mandatory cooldown, positive + negative tests.    |
+| `logging-contract.mdc`              | Structured stdout logs: stable field names, no f-strings, level discipline.  |
+| `db-access.mdc`                     | Only `Storage` touches SQLite; each query is a named method with a test.     |
+| `architecture-patterns.mdc`         | The Adapter / Facade / Strategy / DI / concurrency patterns to preserve.     |
+| `consistency-and-failure-model.mdc` | The CAP trade-off + idempotency / event-time / single-writer invariants.     |
+
+**`poller-error-handling.mdc` — why.** The poll loop is the heartbeat of the
+system and Open-Meteo is a third party we don't control. If one city's `500`
+or a DNS blip could raise out of the cycle, a transient upstream failure would
+silently stop data collection for *all* cities. The rule makes survival the
+default (catch, retry with backoff, give up to `None`) and keeps every failure
+observable as a `WARNING` with stable fields — without using `ERROR`/`exception`
+for something we are deliberately tolerating.
+
+**`event-record-shape.mdc` — why.** The `events` table *is* the product, so a
+ragged shape is a correctness bug, not a style nit. A missing `reason` or a
+free-form `severity` makes events unusable to a client; a missing `COOLDOWN`
+entry produces the "events that never stop firing" failure mode the brief warns
+about. Requiring a positive **and** a negative test per `event_type` turns each
+detector's intent into something executable rather than asserted in prose.
+
+**`logging-contract.mdc` — why.** The logs are a graded interface and a
+debugging surface, so they must be machine-parseable. Stable field names
+(`city`, never `city_name`) and `extra={}` over f-strings keep them
+grep/jq-able; one logger per module makes the source of a line obvious; level
+discipline keeps `WARNING`/`ERROR` meaningful instead of noise.
+
+**`db-access.mdc` — why.** Funnelling every query through one `Storage` seam is
+what lets the storage engine change (SQLite → Postgres) without touching routes,
+the poller, or detectors, and it puts every query in one testable place. The
+explicit skill exception exists for a concrete reason: skills run *outside* the
+API process and would contend with the live WAL, so they get their own
+read-only (`mode=ro`) connection.
+
+**`architecture-patterns.mdc` — why.** This is the rule that makes the
+structural seams explicit (see Design rationale #1). Documenting the Adapter and
+Facade boundaries — and that detectors are pure, that wiring happens only at the
+composition root — is what stops the most common AI-assisted regression: "just
+parse the response / run the SQL right here."
+
+**`consistency-and-failure-model.mdc` — why.** The guarantees that make dedup,
+backfill, and replay correct are spread across `storage.py`, `events.py`,
+`poller.py`, and the skills — no single file makes the contract visible. That
+makes it easy to "optimise" one of them (dedup on `fetched_at`, fetch on read)
+and quietly break replay determinism or duplicate suppression. Writing the CAP
+trade-off and the invariants down makes those choices deliberate and reviewable.
 
 ### Agents (`.cursor/agents/`)
 
@@ -545,26 +711,37 @@ has been done).
 ```
 .
 ├── .cursor/
-│   ├── rules/                       # active conventions
+│   ├── rules/                       # active conventions (one concern each)
 │   │   ├── poller-error-handling.mdc
 │   │   ├── event-record-shape.mdc
 │   │   ├── logging-contract.mdc
-│   │   └── db-access.mdc
-│   ├── agents/
-│   │   └── event-logic-reviewer.md
+│   │   ├── db-access.mdc
+│   │   ├── architecture-patterns.mdc
+│   │   └── consistency-and-failure-model.mdc
+│   ├── agents/                      # atomic reviewers + one executor
+│   │   ├── event-logic-reviewer.md
+│   │   ├── data-layer-reviewer.md
+│   │   ├── poller-resilience-reviewer.md
+│   │   ├── ops-ci-agent.md
+│   │   └── qa-verifier.md
 │   └── skills/
 │       ├── analyze_data/{SKILL.md, analyze.py}
 │       └── replay_events/{SKILL.md, replay.py}
-├── .github/workflows/ci.yml         # test + build jobs
+├── .github/workflows/ci.yml         # test + build (docker + smoke) jobs
 ├── src/watchagent/
 │   ├── api/{routes.py, schemas.py}
 │   ├── config.py                    # cities, env-var settings
-│   ├── events.py                    # the three detector families + cooldown
+│   ├── events.py                    # detector families + cooldown + thresholds
+│   ├── climate.py                   # loads per-city seasonal normals
+│   ├── climate_normals.json         # shared priors (detector + skill read this)
 │   ├── logging_setup.py             # structured-ish stdout logging
 │   ├── main.py                      # FastAPI app, lifespan wires it all up
-│   ├── openmeteo.py                 # HTTP client + response parsing
+│   ├── openmeteo.py                 # HTTP client + response parsing (Adapter)
 │   ├── poller.py                    # background poll loop with retries
-│   └── storage.py                   # sole owner of aiosqlite access
+│   └── storage.py                   # sole owner of aiosqlite access (Facade)
+├── scripts/
+│   ├── backfill.py                  # pull real history through the detectors
+│   └── smoke_test.sh                # build + run container, assert /health
 ├── tests/
 │   ├── conftest.py
 │   ├── test_dedup.py
@@ -573,6 +750,7 @@ has been done).
 ├── Dockerfile                       # multi-stage, non-root, slim runtime
 ├── docker-compose.yml               # named volume for persistence
 ├── pyproject.toml
+├── .gitignore                       # ignores all .env* except .env.example
 ├── .env.example
 └── README.md
 ```
